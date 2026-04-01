@@ -1468,12 +1468,18 @@ def _extract_pins(text):
 def _extract_file_memory(text):
     return re.findall(r'\[FILE_MEMORY:\s*(.+?)\]', text)
 
+def _extract_thinking(text):
+    """Extract [THINKING: ...] marker from AI response."""
+    m = re.search(r'\[THINKING:\s*(.+?)\]', text)
+    return m.group(1).strip() if m else ""
+
 def _clean_text(text):
     t = re.sub(r'```(?:python|bash|sh)\s*\n.*?```', '', text, flags=re.DOTALL)
     for pat in (r'\[SEND_FILE:.*?\]', r'\[STOP_SCRIPT:.*?\]', r'\[WEB_SEARCH:.*?\]',
                 r'\[WEB_SCRAPE:.*?\]', r'\[DEEP_SCAN:.*?\]', r'\[CREATE_FOLDER:.*?\]',
                 r'\[DELETE_FOLDER:.*?\]', r'\[SUB_AGENT:.*?\]', r'\[MEMORY_SAVE:.*?\]',
-                r'\[MEMORY_QUERY:.*?\]', r'\[PIN:.*?\]', r'\[FILE_MEMORY:.*?\]'):
+                r'\[MEMORY_QUERY:.*?\]', r'\[PIN:.*?\]', r'\[FILE_MEMORY:.*?\]',
+                r'\[THINKING:.*?\]'):
         t = re.sub(pat, '', t)
     t = t.replace("[STOP_ALL_SCRIPTS]", "")
     return re.sub(r'\n{3,}', '\n\n', t).strip()
@@ -1488,21 +1494,23 @@ def _bq(text):
     return f"<blockquote>{text}</blockquote>"
 
 def _think(status="", session=None):
-    """Generate thinking display — with optional live task tree."""
-    lines = ["🧠 <b>AI sedang berfikir...</b>"]
+    """Generate thinking display — Main Agent reasoning + sub-agents."""
+    lines = ["🧠 <b>Main Agent sedang berfikir...</b>"]
     if status:
         lines.append(status)
-    if session and (session.task_desc or session.live_items):
-        lines.append("")
+    if session:
         if session.task_desc:
-            lines.append(f"📋 <b>Task:</b> {esc(session.task_desc)}")
-        for item in session.live_items:
-            t_icon = "🤖" if item.get("type") == "sub" else "⚡"
-            lines.append(
-                f"  {t_icon} <code>{item['id']}</code> "
-                f"<b>{esc(item['name'])}</b> — "
-                f"{item['icon']} {item['status']}"
-            )
+            lines.append("")
+            lines.append(f"💭 {esc(session.task_desc)}")
+        if session.live_items:
+            lines.append("")
+            for item in session.live_items:
+                t_icon = "🤖" if item.get("type") == "sub" else "⚡"
+                lines.append(
+                    f"  {t_icon} <code>{item['id']}</code> "
+                    f"<b>{esc(item['name'])}</b> — "
+                    f"{item['icon']} {item['status']}"
+                )
     return "\n".join(lines)
 
 async def _send(bot, cid, text, **kw):
@@ -1825,6 +1833,15 @@ Python:    {PY_VER}
 - WAJIB CUBA DULU sebelum cakap tak boleh
 - JANGAN guna [SEND_FILE:] dalam respons yang sama dengan code block
 
+7️⃣ THINKING DISPLAY
+   WAJIB tulis [THINKING: ayat ringkas] di awal setiap respons.
+   Ini akan dipaparkan kepada user sebagai status pemikiran kau.
+   Contoh:
+   - User kata "hai" → [THINKING: Pengguna beri salam — balas ringkas sahaja]
+   - User minta buat script → [THINKING: Perlu buat Python script untuk scrape data, simpan ke CSV]
+   - User hantar error → [THINKING: Analisa error ini — nampak issue pada line 45, perlu fix syntax]
+   Tulis dalam bahasa yang sama dengan user. Ayat mestilah RINGKAS (max 80 aksara).
+
 {CREDIT}
 """
 
@@ -1926,7 +1943,7 @@ async def _process(bot, cid: int, session: Session, user_content: str):
     session.busy = True
     session.cancel_event.clear()
     session.busy_since = time.time()
-    session.task_desc = user_content[:60].replace("\n", " ")
+    session.task_desc = ""   # Will be set by AI's [THINKING:] marker
     session.live_items = []
     _sent_paths: set[str] = set()
 
@@ -2003,6 +2020,12 @@ async def _process(bot, cid: int, session: Session, user_content: str):
                 # Save AI response to memory
                 hist_resp = resp if len(resp) <= 6000 else resp[:5500] + "\n...[dipotong]"
                 memory_mgr.log_message(uid, "assistant", hist_resp)
+
+                # ── Extract AI Thinking ──────────────────────
+                thinking = _extract_thinking(resp)
+                if thinking:
+                    session.task_desc = thinking
+                    mid = await _edit(bot, cid, mid, _live())
 
                 # ── Process Memory Markers ────────────────────
                 for ms in _extract_memory_saves(resp):
