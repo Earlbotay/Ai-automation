@@ -502,12 +502,60 @@ memory_mgr = MemoryManager(DB_PATH, MEMORY_DIR)
 
 MAX_AI_RETRIES = 5
 
+def _est_msg_tokens(messages: list) -> int:
+    """Rough token estimation: ~4 chars per token."""
+    total = 0
+    for m in messages:
+        total += len(m.get("content", "")) // 4 + 4  # +4 per message overhead
+    return total
+
+
+def _trim_messages(messages: list, target_tokens: int) -> list:
+    """
+    Trim messages to fit within target token count.
+    Strategy: Keep system messages (prompt, pins, summaries) + newest conversation.
+    Progressively remove oldest conversation turns.
+    """
+    if _est_msg_tokens(messages) <= target_tokens:
+        return messages
+
+    # Separate system messages from conversation
+    system_msgs = [m for m in messages if m["role"] == "system"]
+    conv_msgs = [m for m in messages if m["role"] != "system"]
+
+    sys_tokens = _est_msg_tokens(system_msgs)
+    available = target_tokens - sys_tokens
+
+    if available < 2000:
+        # System prompt itself too big — truncate system content
+        for m in system_msgs:
+            if len(m["content"]) > 4000:
+                m["content"] = m["content"][:4000] + "\n...[dipotong untuk had context]"
+        sys_tokens = _est_msg_tokens(system_msgs)
+        available = target_tokens - sys_tokens
+
+    # Keep as many recent conversation messages as possible
+    trimmed_conv = []
+    running = 0
+    for m in reversed(conv_msgs):
+        t = len(m.get("content", "")) // 4 + 4
+        if running + t > available:
+            break
+        trimmed_conv.insert(0, m)
+        running += t
+
+    result = system_msgs + trimmed_conv
+    log.info(f"Context trimmed: {len(messages)} → {len(result)} msgs, "
+             f"~{_est_msg_tokens(result)} tokens (target: {target_tokens})")
+    return result
+
+
 async def ai_call(messages: list, model: str = None, max_tokens: int = None,
                   temperature: float = 0.7, timeout: float = AI_TIMEOUT) -> str:
     """
-    Call Groq API with automatic fallback.
+    Call Groq API with automatic fallback + 413 auto-trim.
     Primary: gpt-oss-120b → Fallback: kimi-k2-instruct-0905
-    Handles: rate limits (429), server errors (5xx), timeouts.
+    Handles: rate limits (429), server errors (5xx), timeouts, payload too large (413).
     """
     if model is None:
         model = PRIMARY_MODEL
@@ -524,16 +572,22 @@ async def ai_call(messages: list, model: str = None, max_tokens: int = None,
         models_to_try.append(FALLBACK_MODEL)
 
     last_err = None
+    current_messages = messages  # may get trimmed on 413
 
     for current_model in models_to_try:
-        mt = MODEL_SPECS.get(current_model, {}).get("max_output", 16384)
-        if max_tokens > mt:
-            max_tokens = mt
+        spec = MODEL_SPECS.get(current_model, {})
+        mt = spec.get("max_output", 16384)
+        ctx_limit = spec.get("context", 131072)
+        current_max_tokens = min(max_tokens, mt)
+
+        # Pre-trim: ensure input + output fits context window
+        input_budget = ctx_limit - current_max_tokens - 500  # 500 token safety buffer
+        current_messages = _trim_messages(current_messages, input_budget)
 
         payload = {
             "model": current_model,
-            "messages": messages,
-            "max_tokens": max_tokens,
+            "messages": current_messages,
+            "max_tokens": current_max_tokens,
             "temperature": temperature,
         }
 
@@ -547,6 +601,21 @@ async def ai_call(messages: list, model: str = None, max_tokens: int = None,
                         retry_after = min(retry_after, 30)
                         log.warning(f"[{current_model}] Rate limited. Retry in {retry_after}s")
                         await asyncio.sleep(retry_after)
+                        continue
+
+                    if r.status_code == 413:
+                        # Payload too large → aggressive trim & reduce output
+                        log.warning(f"[{current_model}] 413 Payload Too Large — trimming context")
+                        current_max_tokens = min(current_max_tokens, 8192)
+                        input_budget = max(input_budget // 2, 4000)
+                        current_messages = _trim_messages(messages, input_budget)
+                        payload = {
+                            "model": current_model,
+                            "messages": current_messages,
+                            "max_tokens": current_max_tokens,
+                            "temperature": temperature,
+                        }
+                        await asyncio.sleep(1)
                         continue
 
                     if r.status_code >= 500:
@@ -571,6 +640,18 @@ async def ai_call(messages: list, model: str = None, max_tokens: int = None,
                 last_err = e
                 if e.response.status_code == 429:
                     await asyncio.sleep(min(2 ** (attempt + 1), 30))
+                elif e.response.status_code == 413:
+                    # Also handle 413 raised as exception
+                    current_max_tokens = min(current_max_tokens, 8192)
+                    input_budget = max(input_budget // 2, 4000)
+                    current_messages = _trim_messages(messages, input_budget)
+                    payload = {
+                        "model": current_model,
+                        "messages": current_messages,
+                        "max_tokens": current_max_tokens,
+                        "temperature": temperature,
+                    }
+                    continue
                 else:
                     break  # non-retryable → try fallback
             except Exception as e:
@@ -2743,27 +2824,7 @@ async def post_init(app: Application):
     asyncio.create_task(_auto_restart_watcher(app))
     log.info(f"Auto-restart watcher started (duration: {RUN_DURATION}s, buffer: {RESTART_BUFFER}s)")
 
-    # Notify owner
-    try:
-        elapsed = time.time() - BOT_START_TIME
-        remaining = max(0, RUN_DURATION - elapsed)
-        r_h, r_r = divmod(int(remaining), 3600)
-        r_m, _ = divmod(r_r, 60)
-
-        await app.bot.send_message(
-            chat_id=OWNER_ID,
-            text=(
-                f"🚀 <b>Bot v5.0 started!</b>\n\n"
-                f"🧠 Primary: <code>{PRIMARY_MODEL}</code>\n"
-                f"🔄 Fallback: <code>{FALLBACK_MODEL}</code>\n"
-                f"⏱ Shutdown in: {r_h}h {r_m}m (cron auto-restarts)\n"
-                f"💾 Memory: 5-layer active\n"
-                f"🐍 Python {PY_VER}"
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception as e:
-        log.warning(f"Failed to send startup notification: {e}")
+    log.info(f"Bot v5.0 ready — Primary: {PRIMARY_MODEL}, Fallback: {FALLBACK_MODEL}")
 
 
 def main():
